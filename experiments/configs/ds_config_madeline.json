@@ -1,0 +1,38 @@
+{
+  "train_batch_size": 8,
+  "train_micro_batch_size_per_gpu": 2,
+  "gradient_accumulation_steps": 2,
+  "steps_per_print": 10,
+  "optimizer": {
+    "type": "Adam",
+    "params": {
+      "lr": 5e-5,
+      "betas": [0.9, 0.999],
+      "eps": 1e-8
+    }
+  },
+  "fp16": {
+    "enabled": true,
+    "loss_scale": 0,
+    "initial_scale_power": 16
+  },
+  "zero_optimization": {
+    "stage": 3,
+    "stage3_prefetch_bucket_size": 50000000,
+    "stage3_param_persistence_threshold": 100000,
+    "stage3_max_live_parameters": 1000000000,
+    "stage3_max_reuse_distance": 1000000000,
+    "overlap_comm": true,
+    "forward_cache": {
+      "enabled": true,
+      "auto_profile": true,
+      "reserved_memory_ratio": 0.1,
+      "gain_weights": {
+        "position": 0.5,
+        "efficiency": 0.5
+      },
+      "verbose": true
+    }
+  },
+  "wall_clock_breakdown": true
+}

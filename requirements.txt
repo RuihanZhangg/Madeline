@@ -1,0 +1,16 @@
+# Madeline: Core dependencies
+torch>=2.1.0
+deepspeed>=0.15.0
+
+# Experiment dependencies
+transformers>=4.35.0
+datasets>=2.14.0
+accelerate>=0.24.0
+
+# Development & Testing
+pytest>=7.0
+pytest-cov
+
+# Monitoring (optional)
+tensorboard
+wandb

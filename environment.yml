@@ -1,0 +1,19 @@
+name: madeline
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch>=2.1.0
+  - pytorch-cuda=12.1
+  - pip
+  - pip:
+    - deepspeed>=0.15.0
+    - transformers>=4.35.0
+    - datasets>=2.14.0
+    - accelerate>=0.24.0
+    - pytest>=7.0
+    - pytest-cov
+    - tensorboard
