@@ -209,3 +209,8 @@ __marimo__/
 # tools
 .qoder/
 nul
+
+# DeepSpeed fork is managed as a separate repository
+# See: https://github.com/RuihanZhangg/DeepSpeed
+_deepspeed_ref/
+_deepspeed_fork_temp/
