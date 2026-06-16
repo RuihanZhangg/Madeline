@@ -17,7 +17,7 @@ import pytest
 _mock_torch = MagicMock()
 _mock_torch.cuda.max_memory_allocated = MagicMock(return_value=0)
 _mock_torch.cuda.get_device_properties = MagicMock(
-    return_value=MagicMock(total_mem=16_000_000_000)
+    return_value=MagicMock(total_memory=16_000_000_000)
 )
 sys.modules.setdefault("torch", _mock_torch)
 

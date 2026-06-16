@@ -42,7 +42,7 @@ class MemoryProfiler:
     def capture_peak(self) -> None:
         """Capture peak memory usage.  Call this after the first iteration."""
         self._peak_memory = torch.cuda.max_memory_allocated(self.device)
-        self._total_memory = torch.cuda.get_device_properties(self.device).total_mem
+        self._total_memory = torch.cuda.get_device_properties(self.device).total_memory
         self._profiled = True
         logger.info(
             f"[Madeline MemoryProfiler] peak_memory={self._peak_memory / 1e9:.2f} GB, "

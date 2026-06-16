@@ -27,7 +27,7 @@ class TestMemoryProfiler:
         # 12 GB total, 6 GB peak, 10% safety -> budget = 12 - 6 - 1.2 = 4.8 GB
         _mock_torch.cuda.max_memory_allocated.return_value = 6_000_000_000
         _mock_torch.cuda.get_device_properties.return_value = MagicMock(
-            total_mem=12_000_000_000
+            total_memory=12_000_000_000
         )
 
         profiler = MemoryProfiler(reserved_memory_ratio=0.1, device=0)
@@ -41,7 +41,7 @@ class TestMemoryProfiler:
         """Budget in numel for fp16 (2 bytes per element)."""
         _mock_torch.cuda.max_memory_allocated.return_value = 6_000_000_000
         _mock_torch.cuda.get_device_properties.return_value = MagicMock(
-            total_mem=12_000_000_000
+            total_memory=12_000_000_000
         )
 
         profiler = MemoryProfiler(reserved_memory_ratio=0.1, device=0)
@@ -55,7 +55,7 @@ class TestMemoryProfiler:
         """When nearly all memory is used, budget should be 0."""
         _mock_torch.cuda.max_memory_allocated.return_value = 11_500_000_000
         _mock_torch.cuda.get_device_properties.return_value = MagicMock(
-            total_mem=12_000_000_000
+            total_memory=12_000_000_000
         )
 
         profiler = MemoryProfiler(reserved_memory_ratio=0.1, device=0)
@@ -75,7 +75,7 @@ class TestMemoryProfiler:
         """Zero safety margin should use all available memory."""
         _mock_torch.cuda.max_memory_allocated.return_value = 4_000_000_000
         _mock_torch.cuda.get_device_properties.return_value = MagicMock(
-            total_mem=12_000_000_000
+            total_memory=12_000_000_000
         )
 
         profiler = MemoryProfiler(reserved_memory_ratio=0.0, device=0)

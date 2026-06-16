@@ -64,7 +64,7 @@ if torch.cuda.is_available():
     print(f'  CUDA version: {torch.version.cuda}')
     print(f'  GPU count: {torch.cuda.device_count()}')
     for i in range(torch.cuda.device_count()):
-        print(f'  GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_mem / 1e9:.1f} GB)')
+        print(f'  GPU {i}: {torch.cuda.get_device_name(i)} ({torch.cuda.get_device_properties(i).total_memory / 1e9:.1f} GB)')
 "
 
 # ---- Step 4: 克隆并安装修改后的 DeepSpeed ----
@@ -130,7 +130,7 @@ print()
 print('  Memory per GPU:')
 for i in range(torch.cuda.device_count()):
     props = torch.cuda.get_device_properties(i)
-    print(f'    GPU {i}: {props.name} - {props.total_mem / 1e9:.1f} GB')
+    print(f'    GPU {i}: {props.name} - {props.total_memory / 1e9:.1f} GB')
 "
 
 echo ""
