@@ -1,14 +1,9 @@
 # Madeline
 本项目是对于Deepspeed框架的优化，主要是对ZeRO-3的缓存模块研究。
 
-
-先说明一个我刚才修正的问题：`ds_config_madeline.json` 中的 `gain_weights` 使用了旧的字段名 `position`/`efficiency`，已更正为当前代码实际使用的 `alpha`/`beta`。
-
 ---
 
-## 两 GPU 服务器完整操作步骤
-
-### 方案 A：一键脚本（推荐）
+## 指南
 
 #### 1. 服务器前置要求
 
@@ -59,43 +54,6 @@ bash experiments/scripts/run_madeline.sh small 50
 ```bash
 bash experiments/scripts/run_madeline.sh small 50 4   # 4 卡
 ```
-
----
-
-### 方案 B：手动部署（已有 DeepSpeed 环境）
-
-如果服务器已安装 DeepSpeed，不想重新 clone：
-
-```bash
-# 1. 安装 Madeline
-cd Madeline
-pip install -e ".[experiment]"
-
-# 2. 应用 patch 到现有 DeepSpeed
-python tools/apply_deepspeed_patch.py
-
-# 3. 验证 patch 是否生效
-python -c "
-import deepspeed
-from deepspeed.runtime.zero.config import DeepSpeedZeroConfig
-print('forward_cache field:', hasattr(DeepSpeedZeroConfig(), 'forward_cache'))
-"
-
-# 4. 运行
-bash experiments/scripts/run_madeline.sh small 50
-```
-
----
-
-### 配置检查清单
-
-| 检查项 | 当前状态 | 说明 |
-|--------|---------|------|
-| `train_micro_batch_size_per_gpu` | 2 | 两卡时总 batch = 2×2×2 = 8 ✅ |
-| `stage3_prefetch_bucket_size` | 50M | 与 Madeline `prefetch_bucket_size` 默认值一致 ✅ |
-| `forward_cache.enabled` | true (madeline) | `ds_config_madeline.json` 中已开启 ✅ |
-| `forward_cache.gain_weights` | `alpha:1.0, beta:1.0` | 刚修正的旧字段名问题 ✅ |
-| GPU 数量默认值 | 2 | `run_*.sh` 中 `NUM_GPUS=${3:-2}` ✅ |
 
 ---
 

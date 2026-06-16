@@ -122,5 +122,4 @@ def create_quad_bar_charts(
     plt.show()
 
 if __name__ == "__main__":
-    # Example usage with default parameters
     create_quad_bar_charts()

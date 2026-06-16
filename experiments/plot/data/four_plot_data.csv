@@ -2,4 +2,4 @@ method,x_label,throughput_7b,throughput_13b,mfu_7b,mfu_13b
 ZeRO-3,a,530,320,38,38
 ZeRO-3 w/ BS,b,594,342,45,40
 ZeRO-3 w/ BS & Ours,c,608,352,47,41
-ZeRO-3 w/ Ours,d,650,360,55,45.1
+ZeRO-3 w/ Ours,d,650,360,55,45
