@@ -1,0 +1,4 @@
+model,baseline_throughput,madeline_throughput,baseline_mem,madeline_mem,hardware_limit
+Llama-7B,3200,3924,8.8,21.8,32.0
+Llama-13B,1650,2003,16.0,29.4,32.0
+Llama-30B,580,595,29.6,30.2,32.0

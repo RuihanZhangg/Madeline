@@ -1,0 +1,4 @@
+model,baseline_throughput,madeline_throughput
+Llama-7B,530,650
+Llama-13B,320,360
+Llama-30B,150,155

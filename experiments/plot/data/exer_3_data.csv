@@ -1,0 +1,4 @@
+model,baseline_mem,madeline_mem,hardware_limit
+7B,8.8,21.8,32.0
+13B,16.0,29.4,32.0
+30B,26.6,29.3,32.0
