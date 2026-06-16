@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 _mock_torch = MagicMock()
 _mock_torch.cuda.max_memory_allocated = MagicMock(return_value=0)
 _mock_torch.cuda.get_device_properties = MagicMock()
-sys.modules.setdefault("torch", _mock_torch)
+sys.modules["torch"] = _mock_torch
 
 from madeline.memory_profiler import MemoryProfiler
 

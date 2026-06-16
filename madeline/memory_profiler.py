@@ -85,14 +85,21 @@ class MemoryProfiler:
             A dict mapping ``sub_module.ds_id`` to the total numel of its
             parameters when fully gathered.
         """
-        from deepspeed.runtime.zero.partitioned_param_coordinator import iter_params
-        from deepspeed.utils import z3_leaf_module
-
         sizes: Dict[int, int] = {}
         for module in submodule_order:
+            # Prefer DeepSpeed's iter_params when available (handles external
+            # parameters and leaf-module recursion correctly).  Fall back to
+            # standard ``module.parameters()`` for environments without DeepSpeed
+            # installed (e.g. lightweight tests).
+            try:
+                from deepspeed.runtime.zero.partitioned_param_coordinator import iter_params
+                from deepspeed.utils import z3_leaf_module
+                params = iter_params(module, recurse=z3_leaf_module(module))
+            except Exception:  # pragma: no cover
+                params = module.parameters()
+
             total_numel = sum(
-                p.ds_numel
-                for p in iter_params(module, recurse=z3_leaf_module(module))
+                p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in params
             )
             sizes[module.ds_id] = total_numel
         return sizes

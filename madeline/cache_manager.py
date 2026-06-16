@@ -62,14 +62,13 @@ class ForwardCacheManager:
         self._gain_model: Optional[GainModel] = None
 
         # Statistics (per iteration, for logging)
-        self._stats_cached_numel: int = 0
         self._stats_allgather_skipped: int = 0
 
     def should_cache(self, ds_id: int) -> bool:
         """Return True if the given sub-module's parameters should be kept cached.
 
-        This is only meaningful during the forward phase.  During backward,
-        all parameters are released after use regardless.
+        Only meaningful during the forward phase.  During backward, all
+        parameters are released after use regardless.
 
         Args:
             ds_id: The ``ds_id`` attribute of the sub-module.
@@ -94,6 +93,10 @@ class ForwardCacheManager:
         Called once from ``PartitionedParameterCoordinator.reset_step()`` when
         the trace transitions from RECORD to COMPLETE.
 
+        The gain model requires:
+        - ``prefetch_bucket_size`` from config (matches DeepSpeed setting).
+        - ``model_total_numel`` (D): computed from the submodule trace.
+
         Args:
             submodule_order: The frozen sub-module trace from the coordinator.
             bytes_per_element: Bytes per parameter element (2 for fp16/bf16).
@@ -101,11 +104,11 @@ class ForwardCacheManager:
         if self._initialized:
             return
 
-        # Determine memory budget
+        # -- Step 1: Determine memory budget --
         if self.config.memory_budget_numel is not None:
             budget_numel = self.config.memory_budget_numel
             logger.info(
-                f"[Madeline] Using explicit memory budget: {budget_numel} numel"
+                f"[Madeline] Using explicit memory budget: {budget_numel:,} numel"
             )
         elif self.config.auto_profile:
             from madeline.memory_profiler import MemoryProfiler
@@ -131,13 +134,31 @@ class ForwardCacheManager:
             self._initialized = True
             return
 
-        # Collect sub-module sizes
+        # -- Step 2: Collect sub-module sizes --
         from madeline.memory_profiler import MemoryProfiler
         submodule_sizes = MemoryProfiler.collect_submodule_sizes(submodule_order)
 
-        # Compute gains and select cache set
+        # -- Step 3: Compute model_total_numel (D) --
+        # D is the sum of all unique module sizes across the forward pass.
+        # We deduplicate by ds_id since the trace contains fwd + bwd visits.
+        from madeline.gain_model import _extract_forward_modules
+        forward_modules = _extract_forward_modules(submodule_order)
+        model_total_numel = sum(
+            submodule_sizes.get(m.ds_id, 0) for m in forward_modules
+        )
+        model_total_numel = max(1, model_total_numel)
+
+        # -- Step 4: Build GainModel with runtime parameters --
         gw = self.config.gain_weights
-        self._gain_model = GainModel(alpha=gw.position, beta=gw.efficiency)
+        self._gain_model = GainModel(
+            alpha=gw.alpha,
+            beta=gw.beta,
+            prefetch_bucket_size=self.config.prefetch_bucket_size,
+            model_total_numel=model_total_numel,
+            capacity_granularity=self.config.capacity_granularity,
+        )
+
+        # -- Step 5: Score and select cache set via DP --
         gains = self._gain_model.compute_gains(submodule_order, submodule_sizes)
         self.cache_set = self._gain_model.select_cache_set(gains, budget_numel)
 
@@ -146,46 +167,40 @@ class ForwardCacheManager:
 
         if self.config.verbose and self.is_active:
             total_cached_numel = sum(
-                submodule_sizes[ds_id]
-                for ds_id in self.cache_set
-                if ds_id in submodule_sizes
+                submodule_sizes.get(ds_id, 0) for ds_id in self.cache_set
             )
             logger.info(
-                f"[Madeline] Cache set initialized: {len(self.cache_set)} modules, "
-                f"{total_cached_numel} numel cached out of {budget_numel} budget"
+                f"[Madeline] Cache initialized: {len(self.cache_set)} modules cached, "
+                f"{total_cached_numel:,} numel used / {budget_numel:,} budget numel | "
+                f"D={model_total_numel:,}  bs={self.config.prefetch_bucket_size:,}"
             )
-            for info in gains:
-                cached_marker = "*" if info.ds_id in self.cache_set else " "
+            for info in sorted(gains, key=lambda g: g.gain_score, reverse=True):
+                marker = "*" if info.ds_id in self.cache_set else " "
                 logger.info(
-                    f"  [{cached_marker}] ds_id={info.ds_id:4d}  "
-                    f"numel={info.numel:12d}  "
-                    f"fwd_idx={info.forward_index:4d}  "
+                    f"  [{marker}] ds_id={info.ds_id:4d}  numel={info.numel:12,}  "
+                    f"bucket={info.bucket_idx}  pos={info.pos_in_bucket}/{info.bucket_size}  "
                     f"gain={info.gain_score:.4e}"
                 )
+        elif not self.is_active:
+            logger.info("[Madeline] No modules selected for caching.")
 
     def get_cached_numel(self, submodule_sizes: Dict[int, int]) -> int:
         """Return the total numel currently designated for caching.
 
         Useful for adjusting ``__max_n_available_params`` in the coordinator
-        so that cached params don't throttle prefetching.
+        so that cached params do not throttle prefetching.
         """
-        return sum(
-            submodule_sizes.get(ds_id, 0)
-            for ds_id in self.cache_set
-        )
+        return sum(submodule_sizes.get(ds_id, 0) for ds_id in self.cache_set)
 
     def on_step_end(self) -> None:
         """Reset per-iteration state.  Called from ``reset_step()``."""
         self.is_forward_phase = True
         if self.config.verbose and self.is_active:
             logger.info(
-                f"[Madeline] Step complete: "
-                f"allgather_skipped={self._stats_allgather_skipped}"
+                f"[Madeline] Step end: allgather_skipped={self._stats_allgather_skipped}"
             )
-        self._stats_cached_numel = 0
         self._stats_allgather_skipped = 0
 
-    def record_allgather_skip(self, ds_id: int, numel: int) -> None:
+    def record_allgather_skip(self, ds_id: int) -> None:
         """Record that an all-gather was skipped for a cached module."""
         self._stats_allgather_skipped += 1
-        self._stats_cached_numel += numel

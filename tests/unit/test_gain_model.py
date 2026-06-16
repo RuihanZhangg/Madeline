@@ -1,149 +1,268 @@
 # Copyright (c) Madeline Project Contributors.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for the Gain Model."""
+"""Unit tests for the Gain Model (new additive formula + DP solver)."""
 
+import math
 import pytest
 from unittest.mock import MagicMock
-from madeline.gain_model import GainModel, ModuleGainInfo
+from madeline.gain_model import GainModel, ModuleGainInfo, BucketInfo, _extract_forward_modules
 
 
-def _make_mock_module(ds_id: int):
-    """Create a mock sub-module with a given ds_id."""
+def _make_module(ds_id: int):
     m = MagicMock()
     m.ds_id = ds_id
     return m
 
 
-class TestGainModel:
-    """Tests for GainModel scoring and selection."""
+def _make_trace(n_forward: int):
+    """Build a canonical fwd+bwd trace for n_forward modules."""
+    fwd = [_make_module(i) for i in range(n_forward)]
+    bwd = list(reversed(fwd))
+    return fwd + bwd, {i: 1000 for i in range(n_forward)}
 
-    def test_compute_gains_basic(self):
-        """Modules closer to output should have higher gain scores."""
-        # Create a trace: 4 forward modules + 4 backward modules (reversed)
-        forward_modules = [_make_mock_module(i) for i in range(4)]
-        backward_modules = list(reversed(forward_modules))
-        submodule_order = forward_modules + backward_modules
 
-        # All modules have equal size
-        sizes = {i: 1000 for i in range(4)}
+# ──────────────────────────────────────────────────────────────────────────────
+# _extract_forward_modules
+# ──────────────────────────────────────────────────────────────────────────────
 
-        model = GainModel(alpha=0.5, beta=0.5)
-        gains = model.compute_gains(submodule_order, sizes)
+class TestExtractForwardModules:
 
-        assert len(gains) == 4
-        # Gains should be sorted descending
-        for i in range(len(gains) - 1):
-            assert gains[i].gain_score >= gains[i + 1].gain_score
-
-        # Module 3 (closest to output) should have highest gain
-        top_module = gains[0]
-        assert top_module.ds_id == 3
-
-    def test_compute_gains_size_matters(self):
-        """Larger modules should have higher gain when position is equal."""
-        forward_modules = [_make_mock_module(i) for i in range(2)]
-        backward_modules = list(reversed(forward_modules))
-        submodule_order = forward_modules + backward_modules
-
-        # Module 0: small, Module 1: large
-        sizes = {0: 100, 1: 10000}
-
-        model = GainModel(alpha=0.5, beta=0.5)
-        gains = model.compute_gains(submodule_order, sizes)
-
-        # Module 1 should have higher gain (larger AND closer to output)
-        assert gains[0].ds_id == 1
-
-    def test_compute_gains_empty_trace(self):
-        """Empty trace should return empty gains."""
-        model = GainModel()
-        gains = model.compute_gains([], {})
-        assert len(gains) == 0
-
-    def test_compute_gains_single_module(self):
-        """Single module trace should work."""
-        m = _make_mock_module(0)
-        submodule_order = [m, m]  # forward + backward
-        sizes = {0: 1000}
-
-        model = GainModel()
-        gains = model.compute_gains(submodule_order, sizes)
-        assert len(gains) == 1
-        assert gains[0].ds_id == 0
-
-    def test_extract_forward_modules(self):
-        """Forward/backward split detection should work correctly."""
-        modules = [_make_mock_module(i) for i in range(5)]
-        # Forward: 0,1,2,3,4 | Backward: 4,3,2,1,0
+    def test_basic_split(self):
+        modules = [_make_module(i) for i in range(5)]
         trace = modules + list(reversed(modules))
+        fwd = _extract_forward_modules(trace)
+        assert [m.ds_id for m in fwd] == [0, 1, 2, 3, 4]
 
-        forward = GainModel._extract_forward_modules(trace)
-        assert len(forward) == 5
-        assert [m.ds_id for m in forward] == [0, 1, 2, 3, 4]
+    def test_empty(self):
+        assert _extract_forward_modules([]) == []
 
-    def test_select_cache_set_budget_constraint(self):
-        """Selection should respect memory budget."""
-        gains = [
-            ModuleGainInfo(ds_id=3, numel=500, forward_index=3, gain_score=10.0),
-            ModuleGainInfo(ds_id=2, numel=500, forward_index=2, gain_score=8.0),
-            ModuleGainInfo(ds_id=1, numel=500, forward_index=1, gain_score=5.0),
-            ModuleGainInfo(ds_id=0, numel=500, forward_index=0, gain_score=2.0),
+    def test_single_module_appears_twice(self):
+        m = _make_module(0)
+        fwd = _extract_forward_modules([m, m])
+        assert len(fwd) == 1
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bucket construction
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestBucketConstruction:
+
+    def _model(self, bs):
+        return GainModel(prefetch_bucket_size=bs, model_total_numel=10000)
+
+    def test_single_bucket_when_all_fit(self):
+        """All modules fit in one bucket when total numel <= bucket_size."""
+        trace, sizes = _make_trace(4)  # 4 modules * 1000 = 4000 numel
+        model = self._model(bs=5000)
+        fwd = _extract_forward_modules(trace)
+        buckets = model._build_buckets(fwd, sizes)
+        assert len(buckets) == 1
+        assert buckets[0].bucket_idx == 1
+        assert len(buckets[0].modules) == 4
+
+    def test_two_buckets_split_evenly(self):
+        """4 modules * 1000 numel, bucket_size=2000 → 2 buckets of 2."""
+        trace, sizes = _make_trace(4)
+        model = self._model(bs=2000)
+        fwd = _extract_forward_modules(trace)
+        buckets = model._build_buckets(fwd, sizes)
+        assert len(buckets) == 2
+        # Each bucket should have 2 modules
+        assert len(buckets[0].modules) == 2
+        assert len(buckets[1].modules) == 2
+
+    def test_bucket_idx_is_one_based(self):
+        trace, sizes = _make_trace(6)
+        model = self._model(bs=2000)
+        fwd = _extract_forward_modules(trace)
+        buckets = model._build_buckets(fwd, sizes)
+        for i, b in enumerate(buckets, start=1):
+            assert b.bucket_idx == i
+
+    def test_backward_order_within_bucket(self):
+        """modules list inside a bucket should be in reverse-forward (backward) order."""
+        trace, sizes = _make_trace(3)  # ids 0,1,2 in forward; bucket_size large
+        model = self._model(bs=99999)
+        fwd = _extract_forward_modules(trace)
+        buckets = model._build_buckets(fwd, sizes)
+        # Forward order is [0,1,2]; backward order should be [2,1,0]
+        assert buckets[0].modules == [2, 1, 0]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Gain formula correctness
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestGainFormula:
+
+    def test_gain_three_terms_additive(self):
+        """G(u) = S(u) + lifespan + latency -- verify manual calculation."""
+        # 4 modules in 1 bucket (bs large), equal size 1000
+        # K=1, k_inv = K - k + 1 = 1
+        # D=4000, bs=99999
+        # Module ids 0..3, forward order [0,1,2,3]
+        # Backward order in bucket: [3,2,1,0] → pos=1..4
+        trace, sizes = _make_trace(4)
+        model = GainModel(
+            alpha=1.0, beta=1.0,
+            prefetch_bucket_size=99999,
+            model_total_numel=4000,
+        )
+        gains = {g.ds_id: g for g in model.compute_gains(trace, sizes)}
+
+        K = 1
+        bs = 99999
+        D = 4000
+        n = 4
+
+        for ds_id in range(4):
+            info = gains[ds_id]
+            k_inv = 1  # only one bucket, k=1, k_inv=1
+            # pos in backward order: module 3 → pos=1, module 0 → pos=4
+            expected_pos = n - ds_id  # module 3 → pos=1, module 0 → pos=4
+            bw_gain = 1000.0
+            lifespan = (k_inv * D / bs) ** 1.0
+            latency = (1.0 - expected_pos / n) ** 1.0
+            expected = bw_gain + lifespan + latency
+            assert abs(info.gain_score - expected) < 1e-6, (
+                f"ds_id={ds_id}: got {info.gain_score}, expected {expected}"
+            )
+
+    def test_tail_module_higher_gain_than_head(self):
+        """Tail module (first in backward) should have higher latency gain than head."""
+        trace, sizes = _make_trace(4)
+        model = GainModel(alpha=0.0, beta=1.0,
+                          prefetch_bucket_size=99999, model_total_numel=4000)
+        gains = {g.ds_id: g for g in model.compute_gains(trace, sizes)}
+        # module 3 is tail (pos=1), module 0 is head (pos=4)
+        assert gains[3].gain_score > gains[0].gain_score
+
+    def test_input_side_module_higher_lifespan(self):
+        """Input-side modules (smaller bucket idx, larger k_inv) should have higher lifespan gain."""
+        # 6 modules, bucket_size=2000 → 3 buckets of 2
+        # bucket 1 (input-side, k=1, k_inv=3) vs bucket 3 (output-side, k=3, k_inv=1)
+        trace, sizes = _make_trace(6)
+        model = GainModel(alpha=1.0, beta=0.0,
+                          prefetch_bucket_size=2000, model_total_numel=6000)
+        gains = {g.ds_id: g for g in model.compute_gains(trace, sizes)}
+
+        # Modules 0,1 are in bucket 1 (input-side); modules 4,5 in bucket 3 (output-side)
+        # Lifespan of bucket-1 modules should be higher
+        assert gains[0].gain_score > gains[5].gain_score
+        assert gains[1].gain_score > gains[4].gain_score
+
+    def test_larger_module_higher_bandwidth_gain(self):
+        """Larger module size → higher gain when other factors are equal."""
+        fwd = [_make_module(0), _make_module(1)]
+        bwd = list(reversed(fwd))
+        trace = fwd + bwd
+        sizes = {0: 100, 1: 100000}
+
+        model = GainModel(alpha=0.0, beta=0.0,
+                          prefetch_bucket_size=99999, model_total_numel=100100)
+        gains = {g.ds_id: g for g in model.compute_gains(trace, sizes)}
+        # alpha=beta=0 → only bandwidth gain; module 1 is much larger
+        assert gains[1].gain_score > gains[0].gain_score
+
+    def test_empty_trace_returns_empty(self):
+        model = GainModel()
+        assert model.compute_gains([], {}) == []
+
+    def test_module_with_zero_size_excluded(self):
+        """Modules with numel=0 should not appear in gains."""
+        trace, _ = _make_trace(3)
+        sizes = {0: 0, 1: 1000, 2: 1000}  # module 0 has no params
+        model = GainModel(prefetch_bucket_size=99999, model_total_numel=2000)
+        gains = model.compute_gains(trace, sizes)
+        assert all(g.ds_id != 0 for g in gains)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DP Solver (select_cache_set)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestDPSolver:
+
+    def _model(self):
+        # Use granularity=1 for exact small-scale tests
+        return GainModel(capacity_granularity=1)
+
+    def _make_gains(self, items):
+        """items: list of (ds_id, numel, gain_score)"""
+        return [
+            ModuleGainInfo(
+                ds_id=ds_id, numel=numel,
+                bucket_idx=1, pos_in_bucket=1, bucket_size=len(items),
+                gain_score=gs,
+            )
+            for ds_id, numel, gs in items
         ]
 
-        model = GainModel()
+    def test_empty_gains(self):
+        model = self._model()
+        assert model.select_cache_set([], 1000) == set()
 
-        # Budget fits 2 modules
-        selected = model.select_cache_set(gains, 1000)
-        assert selected == {3, 2}
+    def test_zero_budget(self):
+        model = self._model()
+        gains = self._make_gains([(0, 100, 5.0)])
+        assert model.select_cache_set(gains, 0) == set()
 
-        # Budget fits 1 module
-        selected = model.select_cache_set(gains, 500)
-        assert selected == {3}
-
-        # Zero budget
-        selected = model.select_cache_set(gains, 0)
-        assert len(selected) == 0
-
-    def test_select_cache_set_large_budget(self):
-        """If budget is large enough, all modules are cached."""
-        gains = [
-            ModuleGainInfo(ds_id=i, numel=100, forward_index=i, gain_score=float(i))
-            for i in range(5)
-        ]
-
-        model = GainModel()
+    def test_all_fit(self):
+        """When budget > total size, select all."""
+        model = self._model()
+        gains = self._make_gains([(0, 100, 1.0), (1, 200, 2.0), (2, 300, 3.0)])
         selected = model.select_cache_set(gains, 10000)
-        assert selected == {0, 1, 2, 3, 4}
+        assert selected == {0, 1, 2}
 
-    def test_select_cache_set_skip_large_module(self):
-        """If a high-gain module doesn't fit, skip it and try the next."""
-        gains = [
-            ModuleGainInfo(ds_id=0, numel=800, forward_index=0, gain_score=10.0),
-            ModuleGainInfo(ds_id=1, numel=200, forward_index=1, gain_score=5.0),
-            ModuleGainInfo(ds_id=2, numel=200, forward_index=2, gain_score=3.0),
-        ]
-
-        model = GainModel()
-        # Budget=400: module 0 doesn't fit (800), but modules 1 and 2 do (200+200)
-        selected = model.select_cache_set(gains, 400)
+    def test_exact_budget(self):
+        """Budget exactly fits two modules; greedy and DP should agree."""
+        model = self._model()
+        gains = self._make_gains([
+            (0, 600, 10.0),
+            (1, 400, 8.0),
+            (2, 400, 6.0),
+        ])
+        # Budget=800: greedy takes 0 (600) → only 200 left, can't fit 1 or 2
+        # DP optimal: take 1+2 (400+400=800, gain=14) > taking 0 alone (gain=10)
+        selected = model.select_cache_set(gains, 800)
         assert selected == {1, 2}
 
-    def test_gain_weights_customization(self):
-        """Different alpha/beta weights should change relative ordering."""
-        forward_modules = [_make_mock_module(i) for i in range(4)]
-        backward_modules = list(reversed(forward_modules))
-        submodule_order = forward_modules + backward_modules
-        sizes = {i: 1000 for i in range(4)}
+    def test_dp_vs_greedy_difference(self):
+        """DP finds optimal solution that greedy misses."""
+        # Classic knapsack counter-example
+        # Items: (id, size, gain)
+        #   A: size=5, gain=10  ← greedy picks first (best ratio)
+        #   B: size=3, gain=7
+        #   C: size=3, gain=7
+        # Capacity=6: greedy picks A (gain=10), DP picks B+C (gain=14)
+        model = self._model()
+        gains = self._make_gains([
+            (0, 5, 10.0),   # A
+            (1, 3, 7.0),    # B
+            (2, 3, 7.0),    # C
+        ])
+        selected = model.select_cache_set(gains, 6)
+        assert selected == {1, 2}
+        # verify total gain is 14 (better than greedy's 10)
 
-        # Position-only: modules near output should dominate
-        model_pos = GainModel(alpha=1.0, beta=0.0)
-        gains_pos = model_pos.compute_gains(submodule_order, sizes)
+    def test_single_item_fits(self):
+        model = self._model()
+        gains = self._make_gains([(0, 100, 5.0)])
+        assert model.select_cache_set(gains, 100) == {0}
 
-        # Efficiency-only
-        model_eff = GainModel(alpha=0.0, beta=1.0)
-        gains_eff = model_eff.compute_gains(submodule_order, sizes)
+    def test_single_item_does_not_fit(self):
+        model = self._model()
+        gains = self._make_gains([(0, 200, 5.0)])
+        assert model.select_cache_set(gains, 100) == set()
 
-        # Both should rank module 3 highest (it benefits from both factors)
-        assert gains_pos[0].ds_id == 3
-        assert gains_eff[0].ds_id == 3
+    def test_respects_capacity_granularity(self):
+        """With granularity=1000, items < 1000 numel round up to 1 unit."""
+        model = GainModel(capacity_granularity=1000)
+        # numel=500 rounds up to 1 unit; budget=1000 → 1 unit
+        gains = self._make_gains([(0, 500, 5.0), (1, 500, 3.0)])
+        # Both items = 1 unit each; budget = 1 unit → only 1 fits
+        selected = model.select_cache_set(gains, 1000)
+        assert len(selected) == 1
+        assert 0 in selected  # higher gain selected
