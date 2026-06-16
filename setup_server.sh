@@ -18,7 +18,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ---- Configuration ----
 # Fork 仓库地址（修改为你自己 fork 的 DeepSpeed 地址）
-DEEPSPEED_FORK_REPO="git@github.com:RuihanZhangg/DeepSpeed.git"
+# 使用 HTTPS 协议，比 SSH 更稳定快速；如需 SSH 可改为 git@github.com:...
+DEEPSPEED_FORK_REPO="https://github.com/RuihanZhangg/DeepSpeed.git"
 DEEPSPEED_BRANCH="madeline"   # 包含 Madeline 修改的分支
 DEEPSPEED_DIR="$SCRIPT_DIR/_deepspeed_ref"
 
@@ -85,8 +86,8 @@ if [ -d "$DEEPSPEED_DIR" ]; then
     git pull origin "$DEEPSPEED_BRANCH" 2>/dev/null || echo "Pull skipped (already up to date or offline)"
     cd "$SCRIPT_DIR"
 else
-    echo "Cloning DeepSpeed fork..."
-    git clone --branch "$DEEPSPEED_BRANCH" "$DEEPSPEED_FORK_REPO" "$DEEPSPEED_DIR"
+    echo "Cloning DeepSpeed fork (shallow, latest commit only)..."
+    git clone --branch "$DEEPSPEED_BRANCH" --depth 1 "$DEEPSPEED_FORK_REPO" "$DEEPSPEED_DIR"
 fi
 
 # 安装 DeepSpeed（editable mode，跳过 C++ 编译加速安装）
