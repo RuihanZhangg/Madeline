@@ -1,7 +1,230 @@
+From 99d00d124a8805f3852dfb286b229a5d1e057acf Mon Sep 17 00:00:00 2001
+From: ruihan_zhang <asterisk0318@gmail.com>
+Date: Tue, 14 Apr 2026 23:01:12 +0800
+Subject: [PATCH 1/3] feat: add forward-pass parameter caching support
+ (Madeline)
+
+Modified 4 ZeRO-3 runtime files to support forward-pass parameter caching:
+- partitioned_param_coordinator.py: skip release for cached modules, phase tracking, cache initialization
+- parameter_offload.py: accept and pass forward_cache_config
+- config.py: add forward_cache field to DeepSpeedZeroConfig
+- stage3.py: parse forward_cache config and pass through initialization
+---
+ deepspeed/runtime/zero/config.py              | 15 ++++++
+ deepspeed/runtime/zero/parameter_offload.py   | 12 +++++
+ .../zero/partitioned_param_coordinator.py     | 46 ++++++++++++++++++-
+ deepspeed/runtime/zero/stage3.py              | 14 +++++-
+ 4 files changed, 85 insertions(+), 2 deletions(-)
+
+diff --git a/deepspeed/runtime/zero/config.py b/deepspeed/runtime/zero/config.py
+index 79fbcb9..ba6fea7 100644
+--- a/deepspeed/runtime/zero/config.py
++++ b/deepspeed/runtime/zero/config.py
+@@ -378,6 +378,21 @@ class DeepSpeedZeroConfig(DeepSpeedConfigModel):
+     Configuration for modules that should be treated as ZeRO3 leaf modules.
+     """
+ 
++    forward_cache: Optional[Dict[str, Any]] = None
++    """
++    [Madeline] Configuration for forward-pass parameter caching.
++    When enabled, selected sub-module parameters are retained in GPU memory
++    after the forward pass, eliminating redundant all-gather in the backward pass.
++    Example:
++    "forward_cache": {
++        "enabled": true,
++        "auto_profile": true,
++        "reserved_memory_ratio": 0.1,
++        "gain_weights": {"position": 0.5, "efficiency": 0.5},
++        "verbose": false
++    }
++    """
++
+     # Validators
+     @model_validator(mode="after")
+     def overlap_comm_valid(self):
+diff --git a/deepspeed/runtime/zero/parameter_offload.py b/deepspeed/runtime/zero/parameter_offload.py
+index c434ff7..87f8d34 100644
+--- a/deepspeed/runtime/zero/parameter_offload.py
++++ b/deepspeed/runtime/zero/parameter_offload.py
+@@ -108,6 +108,7 @@ class DeepSpeedZeRoOffload(object):
+         zero_quantized_nontrainable_weights=False,
+         zero_module_granularity_threshold=0,
+         log_trace_cache_warnings=False,
++        forward_cache_config=None,
+     ):
+ 
+         see_memory_usage("DeepSpeedZeRoOffload initialize [begin]", force=False)
+@@ -162,6 +163,16 @@ class DeepSpeedZeRoOffload(object):
+             self._set_z3_leaf_modules_by_threshold(module, zero_module_granularity_threshold)
+             self.fast_sharding_for_leaf_module = True
+ 
++        # [Madeline] Create forward cache manager if configured
++        self.__forward_cache_manager = None
++        if forward_cache_config is not None and forward_cache_config.enabled:
++            from madeline.cache_manager import ForwardCacheManager
++            self.__forward_cache_manager = ForwardCacheManager(
++                config=forward_cache_config,
++                device=get_accelerator().current_device_name(),
++            )
++            print_rank_0("[Madeline] Forward cache manager created", force=True)
++
+         self.param_coordinator = PartitionedParameterCoordinator(
+             prefetch_bucket_sz=self._prefetch_bucket_sz,
+             max_reuse_distance_in_numel=self._max_reuse_distance_in_numel,
+@@ -174,6 +185,7 @@ class DeepSpeedZeRoOffload(object):
+             zero_quantized_nontrainable_weights=self.zero_quantized_nontrainable_weights,
+             fast_sharding_for_leaf_module=self.fast_sharding_for_leaf_module,
+             log_trace_cache_warnings=self.log_trace_cache_warnings,
++            forward_cache_manager=self.__forward_cache_manager,
+         )
+ 
+         self.forward_hooks = []
+diff --git a/deepspeed/runtime/zero/partitioned_param_coordinator.py b/deepspeed/runtime/zero/partitioned_param_coordinator.py
+index 4877b44..4eecfbf 100644
+--- a/deepspeed/runtime/zero/partitioned_param_coordinator.py
++++ b/deepspeed/runtime/zero/partitioned_param_coordinator.py
+@@ -90,6 +90,7 @@ class PartitionedParameterCoordinator:
+         zero_quantized_nontrainable_weights=False,
+         fast_sharding_for_leaf_module=False,
+         log_trace_cache_warnings=False,
++        forward_cache_manager=None,
+     ) -> None:
+         # mapping of param -> handle for each param that is currently in flight
+         self.__inflight_param_registry = inflight_param_registry
+@@ -147,6 +148,12 @@ class PartitionedParameterCoordinator:
+         self.__ongoing_fetch_leaf_module_events = collections.defaultdict(threading.Event)
+         self.__leaf_module_lock = threading.Lock()
+ 
++        # [Madeline] Forward-pass parameter cache manager.
++        # When set, the coordinator will skip releasing cached sub-modules'
++        # parameters during the forward pass, allowing them to be reused in
++        # the backward pass without an additional all-gather.
++        self.__forward_cache_manager = forward_cache_manager
++
+     """Tracing and Tracking
+     TODO. consider performing trace before initializing PartitionedParameterCoordinator
+     and passing trace results into constructor. This way all the code in here can
+@@ -257,6 +264,25 @@ class PartitionedParameterCoordinator:
+                 print_rank_0(
+                     f"completed record trace of {len(self.__submodule_order)} sub modules: {[m.ds_id for m in self.__submodule_order]}",
+                     force=False)
++
++                # [Madeline] Initialize the forward cache manager now that the
++                # trace is complete and we know the sub-module execution order.
++                if self.__forward_cache_manager is not None:
++                    self.__forward_cache_manager.initialize(
++                        submodule_order=self.__submodule_order,
++                    )
++                    # Increase the max available params budget to account for
++                    # cached params, so they don't throttle prefetching.
++                    if self.__forward_cache_manager.is_active:
++                        from madeline.memory_profiler import MemoryProfiler
++                        sizes = MemoryProfiler.collect_submodule_sizes(self.__submodule_order)
++                        cached_numel = self.__forward_cache_manager.get_cached_numel(sizes)
++                        self.__max_n_available_params += cached_numel
++                        print_rank_0(
++                            f"[Madeline] Increased max_n_available_params by {cached_numel} "
++                            f"to {self.__max_n_available_params} to accommodate cached params",
++                            force=True)
++
+             else:
+                 # Enable trace recording for next forward/backward pass
+                 self.__trace_mode = ZeRoTraceMode.RECORD
+@@ -274,6 +300,10 @@ class PartitionedParameterCoordinator:
+         # Clear leaf module fetch events for clean state
+         self.__ongoing_fetch_leaf_module_events.clear()
+ 
++        # [Madeline] Reset per-iteration cache state
++        if self.__forward_cache_manager is not None:
++            self.__forward_cache_manager.on_step_end()
++
+     def _dump_params(self, tag, sub_module, params, step_id=None):
+         if step_id is None:
+             step_id = self.__step_id
+@@ -298,6 +328,10 @@ class PartitionedParameterCoordinator:
+         2. kick off fetch for next few parameters we will need later (prefetch)
+         3. block on parameters in immediately required sub module
+         """
++        # [Madeline] Update forward/backward phase tracking for cache manager
++        if self.__forward_cache_manager is not None:
++            self.__forward_cache_manager.set_forward_phase(forward)
++
+         # For leaf modules during backward pass, autograd may trigger hooks from multiple
+         # threads concurrently (e.g., when a module returns multiple tensors). We need to
+         # serialize access to prevent race conditions in parameter state management.
+@@ -470,7 +504,17 @@ class PartitionedParameterCoordinator:
+     def release_sub_module(self, submodule: Module, forward=False) -> None:
+         """release the parameters of a sub module, assuming they meet conditions to
+         be released."""
+-        #print_rank_0(f"release_sub_module {'fwd' if forward else 'bwd'}: {debug_module2name_id(submodule)}", force=False)
++        # [Madeline] If the cache manager indicates this module should be cached
++        # during the forward phase, skip releasing its parameters entirely.
++        # The params remain AVAILABLE so that backward pass fetch_sub_module
++        # will find fetch_numel == 0 and skip the all-gather automatically.
++        if (self.__forward_cache_manager is not None
++                and self.__forward_cache_manager.should_cache(submodule.ds_id)):
++            # Still discard active sub-module tracking to avoid assertion errors
++            for param in iter_params(submodule, recurse=z3_leaf_module(submodule)):
++                param.ds_active_sub_modules.discard(submodule.ds_id)
++            return
++
+         params_to_release = (self.__params_to_release(submodule, self.__step_id) if self.is_complete_trace() else set(
+             p.ds_id for p in iter_params(submodule, recurse=z3_leaf_module(submodule))))
+ 
+diff --git a/deepspeed/runtime/zero/stage3.py b/deepspeed/runtime/zero/stage3.py
+index 8f28ee4..1d83974 100644
+--- a/deepspeed/runtime/zero/stage3.py
++++ b/deepspeed/runtime/zero/stage3.py
+@@ -254,6 +254,15 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
+             self._set_zero_group_parallelism()
+             zero_param_parallel_group = groups._get_zero_param_intra_parallel_group()
+ 
++        # [Madeline] Parse forward cache configuration from ds_config
++        self._madeline_forward_cache_config = None
++        zero_config = ds_config.zero_config
++        if hasattr(zero_config, 'forward_cache') and zero_config.forward_cache is not None:
++            from madeline.config import MadelineConfig
++            self._madeline_forward_cache_config = MadelineConfig.from_dict(zero_config.forward_cache)
++            if self._madeline_forward_cache_config.enabled:
++                print_rank_0("[Madeline] Forward cache enabled via config", force=True)
++
+         self.parameter_offload = self.initialize_ds_offload(
+             module=module,
+             timers=timers,
+@@ -273,6 +282,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
+             zero_quantized_nontrainable_weights=zero_quantized_nontrainable_weights,
+             zero_module_granularity_threshold=zero_module_granularity_threshold,
+             log_trace_cache_warnings=log_trace_cache_warnings,
++            forward_cache_config=self._madeline_forward_cache_config,
+         )
+ 
+         self.persistent_parameters = self.parameter_offload.persistent_parameters
+@@ -553,6 +563,7 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
+         zero_quantized_nontrainable_weights,
+         zero_module_granularity_threshold,
+         log_trace_cache_warnings,
++        forward_cache_config=None,
+     ):
+         return DeepSpeedZeRoOffload(module=module,
+                                     timers=timers,
+@@ -571,7 +582,8 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
+                                     zero_quantized_weights=zero_quantized_weights,
+                                     zero_quantized_nontrainable_weights=zero_quantized_nontrainable_weights,
+                                     zero_module_granularity_threshold=zero_module_granularity_threshold,
+-                                    log_trace_cache_warnings=log_trace_cache_warnings)
++                                    log_trace_cache_warnings=log_trace_cache_warnings,
++                                    forward_cache_config=forward_cache_config)
+ 
+     def _get_trainable_parameter_groups(self):
+         param_groups = []
+-- 
+2.53.0.windows.1
+
+
 From ec55d7d8325dac5f2d841341250c530e3707816b Mon Sep 17 00:00:00 2001
 From: ruihan_zhang <asterisk0318@gmail.com>
 Date: Tue, 16 Jun 2026 22:21:52 +0800
-Subject: [PATCH] Add FusedAdam fallback to torch.optim.AdamW on JIT build
+Subject: [PATCH 2/3] Add FusedAdam fallback to torch.optim.AdamW on JIT build
  failure
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -50,6 +273,51 @@ index 799e374..fca6c29 100755
  
          elif self.optimizer_name() == ADAGRAD_OPTIMIZER:
              if self.zero_use_cpu_optimizer():
+-- 
+2.53.0.windows.1
+
+
+From e6148f688cf197df6ffe3dcfbad0b5fc5e98062d Mon Sep 17 00:00:00 2001
+From: ruihan_zhang <asterisk0318@gmail.com>
+Date: Tue, 16 Jun 2026 22:33:11 +0800
+Subject: [PATCH 3/3] fix: handle dict-type ds_config in stage3.py Madeline
+ config parsing
+
+DeepSpeedEngine passes self.config (a raw dict) as ds_config to
+Stage3ZeroOptimizer, not a DeepSpeedConfig object. The original
+Madeline code assumed ds_config was always an object and called
+ds_config.zero_config, which crashed with:
+  AttributeError: 'dict' object has no attribute 'zero_config'
+
+Now handles both dict and object cases via isinstance check.
+---
+ deepspeed/runtime/zero/stage3.py | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/deepspeed/runtime/zero/stage3.py b/deepspeed/runtime/zero/stage3.py
+index 1d83974..110e9c5 100644
+--- a/deepspeed/runtime/zero/stage3.py
++++ b/deepspeed/runtime/zero/stage3.py
+@@ -256,10 +256,16 @@ class DeepSpeedZeroOptimizer_Stage3(ZeROOptimizer):
+ 
+         # [Madeline] Parse forward cache configuration from ds_config
+         self._madeline_forward_cache_config = None
+-        zero_config = ds_config.zero_config
+-        if hasattr(zero_config, 'forward_cache') and zero_config.forward_cache is not None:
++        # ds_config may be a DeepSpeedConfig object or a raw dict depending on caller
++        if isinstance(ds_config, dict):
++            _zero_cfg = ds_config.get('zero_optimization', {})
++            _forward_cache_dict = _zero_cfg.get('forward_cache', None)
++        else:
++            _zero_cfg = getattr(ds_config, 'zero_config', None)
++            _forward_cache_dict = getattr(_zero_cfg, 'forward_cache', None) if _zero_cfg is not None else None
++        if _forward_cache_dict is not None:
+             from madeline.config import MadelineConfig
+-            self._madeline_forward_cache_config = MadelineConfig.from_dict(zero_config.forward_cache)
++            self._madeline_forward_cache_config = MadelineConfig.from_dict(_forward_cache_dict)
+             if self._madeline_forward_cache_config.enabled:
+                 print_rank_0("[Madeline] Forward cache enabled via config", force=True)
+ 
 -- 
 2.53.0.windows.1
 
