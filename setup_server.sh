@@ -73,15 +73,20 @@ echo "[Step 4] Setting up forked DeepSpeed..."
 
 if [ -d "$DEEPSPEED_DIR" ]; then
     echo "DeepSpeed directory already exists at $DEEPSPEED_DIR"
-    echo "Pulling latest changes..."
+    echo "Fetching latest changes..."
     cd "$DEEPSPEED_DIR"
+    # Unshallow in case of previous shallow clone to avoid missing refs
+    if [ -f .git/shallow ]; then
+        echo "Unshallowing clone..."
+        git fetch --unshallow origin 2>/dev/null || true
+    fi
     git fetch origin
     git checkout "$DEEPSPEED_BRANCH" 2>/dev/null || git checkout -b "$DEEPSPEED_BRANCH" "origin/$DEEPSPEED_BRANCH"
-    git pull origin "$DEEPSPEED_BRANCH"
+    git pull origin "$DEEPSPEED_BRANCH" 2>/dev/null || echo "Pull skipped (already up to date or offline)"
     cd "$SCRIPT_DIR"
 else
     echo "Cloning DeepSpeed fork..."
-    git clone --branch "$DEEPSPEED_BRANCH" --depth 50 "$DEEPSPEED_FORK_REPO" "$DEEPSPEED_DIR"
+    git clone --branch "$DEEPSPEED_BRANCH" "$DEEPSPEED_FORK_REPO" "$DEEPSPEED_DIR"
 fi
 
 # 安装 DeepSpeed（editable mode，跳过 C++ 编译加速安装）
