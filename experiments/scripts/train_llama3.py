@@ -18,7 +18,13 @@ to load a pretrained checkpoint directly.
 """
 
 import argparse
+import os
 import time
+
+# Use expandable segments to reduce CUDA memory fragmentation when allocating
+# large optimizer state tensors (e.g. exp_avg, exp_avg_sq, exp_avg_sq_sqrt).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 from torch.utils.data import DataLoader, Dataset
 
@@ -30,6 +36,17 @@ from transformers import LlamaForCausalLM, LlamaConfig
 # Size presets (vocab_size follows LLaMA-3 tokenizer: 128256)
 # ---------------------------------------------------------------------------
 _LLAMA3_CONFIGS = {
+    # ~1B — fits comfortably on 2×V100-32GB for benchmarking
+    "1b": LlamaConfig(
+        hidden_size=2048,
+        intermediate_size=5504,
+        num_hidden_layers=22,
+        num_attention_heads=16,
+        num_key_value_heads=8,        # GQA
+        max_position_embeddings=4096,
+        vocab_size=128256,
+        rms_norm_eps=1e-5,
+    ),
     "7b": LlamaConfig(
         hidden_size=4096,
         intermediate_size=14336,
@@ -120,7 +137,7 @@ def parse_args():
     parser.add_argument(
         "--model_size", type=str, default="7b",
         choices=list(_LLAMA3_CONFIGS.keys()),
-        help="LLaMA-3 model size preset, or pass a HuggingFace model-id via --model_path",
+        help="LLaMA-3 model size preset: 1b/7b/13b/30b/70b, or pass a HuggingFace model-id via --model_path",
     )
     parser.add_argument(
         "--model_path", type=str, default=None,
@@ -183,6 +200,14 @@ def main():
         loss = outputs.loss
 
         model_engine.backward(loss)
+
+        # Save loss value for logging before freeing references
+        loss_value = loss.item()
+
+        # Free references to forward outputs so activation memory can be
+        # released before the optimizer step allocates large state tensors.
+        del outputs, loss
+
         model_engine.step()
 
         step_time = time.time() - step_start
@@ -195,7 +220,7 @@ def main():
             tokens_per_sec = batch_tokens / step_time
             gpu_mem = torch.cuda.max_memory_allocated(device) / 1e9
             print(
-                f"Step {step:4d} | Loss: {loss.item():.4f} | "
+                f"Step {step:4d} | Loss: {loss_value:.4f} | "
                 f"Time: {step_time:.3f}s | "
                 f"Tokens/s: {tokens_per_sec:.0f} | "
                 f"GPU Mem Peak: {gpu_mem:.2f} GB"

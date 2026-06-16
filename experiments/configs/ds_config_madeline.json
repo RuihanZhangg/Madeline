@@ -28,7 +28,7 @@
     "forward_cache": {
       "enabled": true,
       "auto_profile": true,
-      "reserved_memory_ratio": 0.1,
+      "reserved_memory_ratio": 0.25,
       "gain_weights": {
         "alpha": 1.0,
         "beta": 1.0

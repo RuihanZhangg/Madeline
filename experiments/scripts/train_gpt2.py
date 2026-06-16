@@ -8,7 +8,15 @@ experiments with DeepSpeed ZeRO-3.
 """
 
 import argparse
+import os
 import time
+
+# Use expandable segments to reduce CUDA memory fragmentation when allocating
+# large optimizer state tensors (e.g. exp_avg, exp_avg_sq, exp_avg_sq_sqrt).
+# Without this, the caching allocator may hold fragmented "reserved but
+# unallocated" blocks that prevent contiguous allocations during optimizer.step().
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 from torch.utils.data import DataLoader, Dataset
 
@@ -132,6 +140,13 @@ def main():
         # Capture fwd+bwd peak (before optimizer step releases params)
         fwd_bwd_peak = torch.cuda.max_memory_allocated(device) / 1e9
 
+        # Save loss value for logging before freeing references
+        loss_value = loss.item()
+
+        # Free references to forward outputs so activation memory can be
+        # released before the optimizer step allocates large state tensors.
+        del outputs, loss
+
         model_engine.step()
 
         # Capture optimizer step peak
@@ -149,7 +164,7 @@ def main():
         if step % 10 == 0 and local_rank == 0:
             tokens_per_sec = batch_tokens / step_time
             print(
-                f"Step {step:4d} | Loss: {loss.item():.4f} | "
+                f"Step {step:4d} | Loss: {loss_value:.4f} | "
                 f"Time: {step_time:.3f}s | "
                 f"Tokens/s: {tokens_per_sec:.0f} | "
                 f"Fwd+Bwd Mem: {fwd_bwd_peak:.2f} GB | "
