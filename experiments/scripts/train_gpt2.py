@@ -108,6 +108,10 @@ def main():
 
     model_engine.train()
 
+    # Track phase-specific memory peaks
+    fwd_bwd_mem_peak = 0.0
+    step_mem_peak = 0.0
+
     for step, batch in enumerate(dataloader):
         if step >= args.num_steps:
             break
@@ -117,11 +121,24 @@ def main():
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
 
+        # Reset peak counter before forward to measure fwd+bwd peak
+        torch.cuda.reset_peak_memory_stats(device)
+
         outputs = model_engine(input_ids=input_ids, labels=labels)
         loss = outputs.loss
 
         model_engine.backward(loss)
+
+        # Capture fwd+bwd peak (before optimizer step releases params)
+        fwd_bwd_peak = torch.cuda.max_memory_allocated(device) / 1e9
+
         model_engine.step()
+
+        # Capture optimizer step peak
+        step_peak = torch.cuda.max_memory_allocated(device) / 1e9
+
+        fwd_bwd_mem_peak = max(fwd_bwd_mem_peak, fwd_bwd_peak)
+        step_mem_peak = max(step_mem_peak, step_peak)
 
         step_time = time.time() - step_start
         step_times.append(step_time)
@@ -131,12 +148,12 @@ def main():
 
         if step % 10 == 0 and local_rank == 0:
             tokens_per_sec = batch_tokens / step_time
-            gpu_mem = torch.cuda.max_memory_allocated(device) / 1e9
             print(
                 f"Step {step:4d} | Loss: {loss.item():.4f} | "
                 f"Time: {step_time:.3f}s | "
                 f"Tokens/s: {tokens_per_sec:.0f} | "
-                f"GPU Mem Peak: {gpu_mem:.2f} GB"
+                f"Fwd+Bwd Mem: {fwd_bwd_peak:.2f} GB | "
+                f"Step Mem: {step_peak:.2f} GB"
             )
 
     # Summary
@@ -154,7 +171,8 @@ def main():
             print(f"  Total time:         {elapsed:.2f}s")
             print(f"  Avg step time:      {avg_step_time:.4f}s (excluding {warmup} warmup steps)")
             print(f"  Avg tokens/s/gpu:   {avg_tokens_per_sec:.0f}")
-            print(f"  GPU mem peak:       {torch.cuda.max_memory_allocated(device) / 1e9:.2f} GB")
+            print(f"  Fwd+Bwd mem peak:   {fwd_bwd_mem_peak:.2f} GB")
+            print(f"  Step mem peak:      {step_mem_peak:.2f} GB")
             print("=" * 60)
 
 
