@@ -50,15 +50,35 @@ class MemoryProfiler:
         )
 
     def compute_budget_bytes(self) -> int:
-        """Return the memory budget for caching in bytes."""
+        """Return the memory budget for caching in bytes.
+
+        The budget is computed as:
+            total_gpu_mem
+            - peak_memory_after_first_iter   (fwd + bwd peak watermark)
+            - safety_margin                  (reserved_memory_ratio * total)
+            - optimizer_state_estimate       (additional 30% of peak for
+                                              optimizer state, grad buffers,
+                                              temporary tensors like
+                                              exp_avg_sq_sqrt, and activation
+                                              checkpoints that may not appear
+                                              in the fwd-only peak watermark)
+        """
         if not self._profiled:
             raise RuntimeError("MemoryProfiler.capture_peak() must be called first")
         safety_margin = int(self._total_memory * self.reserved_memory_ratio)
-        budget = self._total_memory - self._peak_memory - safety_margin
+        # Extra guard: optimizer states (exp_avg, exp_avg_sq) and gradient
+        # buffers are allocated during optimizer.step(), which is AFTER the
+        # peak watermark is captured.  In addition, Adam/AdamW creates
+        # temporary tensors (e.g., exp_avg_sq_sqrt) of comparable size during
+        # the step.  Reserve 30% of peak as a conservative estimate so the
+        # cache does not crowd out the optimizer.
+        optimizer_state_estimate = int(self._peak_memory * 0.30)
+        budget = self._total_memory - self._peak_memory - safety_margin - optimizer_state_estimate
         budget = max(0, budget)
         logger.info(
             f"[Madeline MemoryProfiler] cache budget={budget / 1e9:.2f} GB "
-            f"(safety_margin={safety_margin / 1e9:.2f} GB)"
+            f"(safety_margin={safety_margin / 1e9:.2f} GB, "
+            f"optimizer_state_estimate={optimizer_state_estimate / 1e9:.2f} GB)"
         )
         return budget
 

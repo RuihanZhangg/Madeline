@@ -1,7 +1,7 @@
 From 99d00d124a8805f3852dfb286b229a5d1e057acf Mon Sep 17 00:00:00 2001
 From: ruihan_zhang <asterisk0318@gmail.com>
 Date: Tue, 14 Apr 2026 23:01:12 +0800
-Subject: [PATCH 1/3] feat: add forward-pass parameter caching support
+Subject: [PATCH 1/4] feat: add forward-pass parameter caching support
  (Madeline)
 
 Modified 4 ZeRO-3 runtime files to support forward-pass parameter caching:
@@ -224,7 +224,7 @@ index 8f28ee4..1d83974 100644
 From ec55d7d8325dac5f2d841341250c530e3707816b Mon Sep 17 00:00:00 2001
 From: ruihan_zhang <asterisk0318@gmail.com>
 Date: Tue, 16 Jun 2026 22:21:52 +0800
-Subject: [PATCH 2/3] Add FusedAdam fallback to torch.optim.AdamW on JIT build
+Subject: [PATCH 2/4] Add FusedAdam fallback to torch.optim.AdamW on JIT build
  failure
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -280,7 +280,7 @@ index 799e374..fca6c29 100755
 From e6148f688cf197df6ffe3dcfbad0b5fc5e98062d Mon Sep 17 00:00:00 2001
 From: ruihan_zhang <asterisk0318@gmail.com>
 Date: Tue, 16 Jun 2026 22:33:11 +0800
-Subject: [PATCH 3/3] fix: handle dict-type ds_config in stage3.py Madeline
+Subject: [PATCH 3/4] fix: handle dict-type ds_config in stage3.py Madeline
  config parsing
 
 DeepSpeedEngine passes self.config (a raw dict) as ds_config to
@@ -318,6 +318,74 @@ index 1d83974..110e9c5 100644
              if self._madeline_forward_cache_config.enabled:
                  print_rank_0("[Madeline] Forward cache enabled via config", force=True)
  
+-- 
+2.53.0.windows.1
+
+
+From a5e306306e58fcf94c710e007d27db3b7125a626 Mon Sep 17 00:00:00 2001
+From: ruihan_zhang <asterisk0318@gmail.com>
+Date: Tue, 16 Jun 2026 23:08:52 +0800
+Subject: [PATCH 4/4] fix: resolve optimizer.step() OOM caused by cached param
+ memory fragmentation
+
+Three-layer fix for CUDA OOM during optimizer.step() when forward-pass
+caching is active:
+
+1. Add get_accelerator().empty_cache() after release_and_reset_all() in
+   partition_all_parameters().  Cached params are correctly released
+   before the optimizer step, but the CUDA caching allocator retains
+   the freed memory as fragmented "reserved but unallocated" blocks.
+   empty_cache() returns these to the GPU so the optimizer can allocate
+   contiguous temporary tensors (e.g., exp_avg_sq_sqrt in Adam/AdamW).
+
+2. Reset forward_cache_manager phase to backward at the top of
+   release_and_reset_all().  This is a defensive measure ensuring
+   should_cache() returns False for any edge-case code path during
+   the optimizer step.
+
+3. (in madeline repo) Increase optimizer_state_estimate in
+   MemoryProfiler from 20% to 30% of peak memory to better account
+   for optimizer temporary allocations not present at profiling time.
+---
+ deepspeed/runtime/zero/parameter_offload.py             | 6 ++++++
+ deepspeed/runtime/zero/partitioned_param_coordinator.py | 7 +++++++
+ 2 files changed, 13 insertions(+)
+
+diff --git a/deepspeed/runtime/zero/parameter_offload.py b/deepspeed/runtime/zero/parameter_offload.py
+index 87f8d34..6534985 100644
+--- a/deepspeed/runtime/zero/parameter_offload.py
++++ b/deepspeed/runtime/zero/parameter_offload.py
+@@ -204,6 +204,12 @@ class DeepSpeedZeRoOffload(object):
+         of modules whose input parameters do not require grad computation do not
+         trigger post call and will therefore will remain unpartitioned"""
+         self.get_param_coordinator().release_and_reset_all(self.module)
++        # [Madeline] After releasing all params (including cached ones), flush
++        # the CUDA caching allocator so that fragmented "reserved but unallocated"
++        # memory is returned to the GPU.  Without this, optimizer.step() may OOM
++        # because it cannot find a contiguous block for temporary tensors
++        # (e.g., exp_avg_sq_sqrt in Adam/AdamW).
++        get_accelerator().empty_cache()
+         for param in iter_params(self.module, recurse=True):
+             if param.ds_status != ZeroParamStatus.NOT_AVAILABLE:
+                 raise RuntimeError(f"{param.ds_summary()} expected to be released")
+diff --git a/deepspeed/runtime/zero/partitioned_param_coordinator.py b/deepspeed/runtime/zero/partitioned_param_coordinator.py
+index 4eecfbf..e7bd570 100644
+--- a/deepspeed/runtime/zero/partitioned_param_coordinator.py
++++ b/deepspeed/runtime/zero/partitioned_param_coordinator.py
+@@ -536,6 +536,13 @@ class PartitionedParameterCoordinator:
+     @torch.no_grad()
+     def release_and_reset_all(self, module: Module) -> None:
+         """release all module parameters"""
++        # [Madeline] Force the cache manager into backward phase so that
++        # should_cache() returns False for any edge-case path.  This ensures
++        # that no param is accidentally retained as "cached" during the
++        # optimizer step.
++        if self.__forward_cache_manager is not None:
++            self.__forward_cache_manager.set_forward_phase(False)
++
+         for param in iter_params(module, recurse=True):
+             if param in self.__inflight_param_registry:
+                 self.__inflight_param_registry.pop(param).wait()
 -- 
 2.53.0.windows.1
 

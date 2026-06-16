@@ -24,7 +24,7 @@ class TestMemoryProfiler:
 
     def test_compute_budget_basic(self):
         """Basic budget computation with known values."""
-        # 12 GB total, 6 GB peak, 10% safety -> budget = 12 - 6 - 1.2 = 4.8 GB
+        # 12 GB total, 6 GB peak, 10% safety, 30% optimizer est -> budget = 3.0 GB
         _mock_torch.cuda.max_memory_allocated.return_value = 6_000_000_000
         _mock_torch.cuda.get_device_properties.return_value = MagicMock(
             total_memory=12_000_000_000
@@ -34,7 +34,7 @@ class TestMemoryProfiler:
         profiler.capture_peak()
 
         budget = profiler.compute_budget_bytes()
-        expected = 12_000_000_000 - 6_000_000_000 - 1_200_000_000  # 4.8 GB
+        expected = 12_000_000_000 - 6_000_000_000 - 1_200_000_000 - 1_800_000_000  # 3.0 GB
         assert budget == expected
 
     def test_compute_budget_numel_fp16(self):
@@ -48,7 +48,7 @@ class TestMemoryProfiler:
         profiler.capture_peak()
 
         budget_numel = profiler.compute_budget_numel(bytes_per_element=2)
-        expected_bytes = 12_000_000_000 - 6_000_000_000 - 1_200_000_000
+        expected_bytes = 12_000_000_000 - 6_000_000_000 - 1_200_000_000 - 1_800_000_000
         assert budget_numel == expected_bytes // 2
 
     def test_compute_budget_near_full(self):
@@ -62,7 +62,7 @@ class TestMemoryProfiler:
         profiler.capture_peak()
 
         budget = profiler.compute_budget_bytes()
-        # 12 - 11.5 - 1.2 = -0.7 -> clamped to 0
+        # 12 - 11.5 - 1.2 - 3.45 = -4.15 -> clamped to 0
         assert budget == 0
 
     def test_compute_budget_before_capture(self):
@@ -82,4 +82,5 @@ class TestMemoryProfiler:
         profiler.capture_peak()
 
         budget = profiler.compute_budget_bytes()
-        assert budget == 8_000_000_000  # 12 - 4 - 0
+        # 12 - 4 - 0 (safety) - 1.2 (optimizer est) = 6.8 GB
+        assert budget == 6_800_000_000
