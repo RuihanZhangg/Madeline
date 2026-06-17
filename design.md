@@ -75,12 +75,12 @@ Due to the accumulation of activation, the memory usage increases before the los
 
 We encapsulate these factors into a unified Gain ($G(u)$) formulation. We model the backward pass of a bucket $B_k$ as an ordered sequence $U_k = \{u_{k,n}, \dots, u_{k,1}\}$, where $u_{k,n}$ is the first executed module (tail module). The Gain of caching module $u$ is defined as:
 \begin{equation}
-    G(u) = \underbrace{S(u)}_{\text{Bandwidth Gain}} + \underbrace{( \frac{k \cdot D}{bs} )^\alpha}_{\text{Lifespan Gain}} + \underbrace{(1-\frac{\text{pos}(u)}{n} )^\beta}_{\text{Latency Gain}}
+    G(u) = \underbrace{S(u)}_{\text{Bandwidth Gain}} + \underbrace{( \frac{k \cdot bs}{D} )^\alpha}_{\text{Lifespan Gain}} + \underbrace{(1-\frac{\text{pos}(u)}{n} )^\beta}_{\text{Latency Gain}}
     \label{eq: gain}
 \end{equation} 
 
 
-Where $S(u)$ is the size of module $u$, representing the deterministic reduction in communication volume. $\text{pos}(u)$ represents the execution index $\in \{1,...n\}$. $bs$ is the \allgather{} bucket size. $\alpha,\beta$ are hyper-parameters balancing bandwidth saving and latency hiding.
+Where $S(u)$ is the size of module $u$, representing the deterministic reduction in communication volume. $\text{pos}(u)$ represents the execution index $\in \{1,...n\}$. $D$ is the total model parameter size, $bs$ is the \allgather{} bucket size, and $K=D/bs$ denotes the total number of buckets. The lifespan gain $\left(\frac{k}{K}\right)^\alpha$ is bounded in $[0,1]$, monotonically increasing with bucket index $k$, reflecting that output-stage modules have shorter lifespans and lower opportunity cost. $\alpha,\beta$ are hyper-parameters balancing bandwidth saving and latency hiding.
 This formula mathematically penalizes head modules ($\text{pos} \to 1$). Since head units cannot unlock the pipeline head, their latency gain decays quadratically, reflecting their lower contribution to pipeline parallelism compared to the tail modules ($\text{pos} \to n$).
 \begin{figure}[t]
 \centerline{\includegraphics[width=\linewidth]{figures/dependency.png}}

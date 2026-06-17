@@ -100,7 +100,7 @@ class TestGainFormula:
     def test_gain_three_terms_additive(self):
         """G(u) = S(u) + lifespan + latency -- verify manual calculation."""
         # 4 modules in 1 bucket (bs large), equal size 1000
-        # K=1, k_inv = K - k + 1 = 1
+        # K=1, k=1
         # D=4000, bs=99999
         # Module ids 0..3, forward order [0,1,2,3]
         # Backward order in bucket: [3,2,1,0] → pos=1..4
@@ -112,46 +112,45 @@ class TestGainFormula:
         )
         gains = {g.ds_id: g for g in model.compute_gains(trace, sizes)}
 
-        K = 1
         bs = 99999
         D = 4000
         n = 4
 
         for ds_id in range(4):
             info = gains[ds_id]
-            k_inv = 1  # only one bucket, k=1, k_inv=1
+            k = 1  # only one bucket
             # pos in backward order: module 3 → pos=1, module 0 → pos=4
             expected_pos = n - ds_id  # module 3 → pos=1, module 0 → pos=4
             bw_gain = 1000.0
-            lifespan = (k_inv * D / bs) ** 1.0
-            latency = (1.0 - expected_pos / n) ** 1.0
+            lifespan = (k * bs / D) ** 1.0
+            latency = (expected_pos / n) ** 1.0
             expected = bw_gain + lifespan + latency
             assert abs(info.gain_score - expected) < 1e-6, (
                 f"ds_id={ds_id}: got {info.gain_score}, expected {expected}"
             )
 
-    def test_tail_module_higher_gain_than_head(self):
-        """Tail module (first in backward) should have higher latency gain than head."""
+    def test_head_module_higher_gain_than_tail(self):
+        """Head module (last in backward, pos=n) should have higher latency gain than tail."""
         trace, sizes = _make_trace(4)
         model = GainModel(alpha=0.0, beta=1.0,
                           prefetch_bucket_size=99999, model_total_numel=4000)
         gains = {g.ds_id: g for g in model.compute_gains(trace, sizes)}
-        # module 3 is tail (pos=1), module 0 is head (pos=4)
-        assert gains[3].gain_score > gains[0].gain_score
+        # module 0 is head (pos=4, pos/n=1.0), module 3 is tail (pos=1, pos/n=0.25)
+        assert gains[0].gain_score > gains[3].gain_score
 
-    def test_input_side_module_higher_lifespan(self):
-        """Input-side modules (smaller bucket idx, larger k_inv) should have higher lifespan gain."""
+    def test_output_side_module_higher_lifespan(self):
+        """Output-side modules (larger bucket idx k) should have higher lifespan gain."""
         # 6 modules, bucket_size=2000 → 3 buckets of 2
-        # bucket 1 (input-side, k=1, k_inv=3) vs bucket 3 (output-side, k=3, k_inv=1)
+        # bucket 1 (input-side, k=1) vs bucket 3 (output-side, k=3)
         trace, sizes = _make_trace(6)
         model = GainModel(alpha=1.0, beta=0.0,
                           prefetch_bucket_size=2000, model_total_numel=6000)
         gains = {g.ds_id: g for g in model.compute_gains(trace, sizes)}
 
-        # Modules 0,1 are in bucket 1 (input-side); modules 4,5 in bucket 3 (output-side)
-        # Lifespan of bucket-1 modules should be higher
-        assert gains[0].gain_score > gains[5].gain_score
-        assert gains[1].gain_score > gains[4].gain_score
+        # Modules 0,1 are in bucket 1 (input-side, k=1); modules 4,5 in bucket 3 (output-side, k=3)
+        # Lifespan of bucket-3 modules should be higher (k=3 > k=1)
+        assert gains[5].gain_score > gains[0].gain_score
+        assert gains[4].gain_score > gains[1].gain_score
 
     def test_larger_module_higher_bandwidth_gain(self):
         """Larger module size → higher gain when other factors are equal."""

@@ -5,24 +5,25 @@
 
 Each sub-module's caching gain is quantified by three additive terms (Eq. 3 in paper):
 
-    G(u) = S(u)  +  (k_inv * D / bs)^alpha  +  (1 - pos(u) / n)^beta
+    G(u) = S(u)  +  (k * bs / D)^alpha  +  (pos(u) / n)^beta
 
 where:
   S(u)          -- Bandwidth Gain: full-gathered numel of module u. Represents the
                    deterministic reduction in AllGather communication volume.
 
-  (k_inv * D / bs)^alpha  -- Lifespan Gain (Inter-Stage / Global): k is the 1-based
+  (k * bs / D)^alpha  -- Lifespan Gain (Inter-Stage / Global): k is the 1-based
                    index of the prefetch-bucket containing u (k=1 input-side, k=K
-                   output-side). k_inv = K - k + 1 so that input-side modules score
-                   higher. D is total model numel; bs is prefetch_bucket_size (numel).
-                   Input-side modules are held in memory from forward to the end of
-                   backprop -- a higher "time-space integral" = higher gain.
+                   output-side). Output-side modules (larger k) score higher because
+                   they are prefetched close to when they are needed in backward,
+                   reducing the "wasted hold time" in memory.
+                   D is total model numel; bs is prefetch_bucket_size (numel).
 
-  (1 - pos(u)/n)^beta  -- Latency Gain (Intra-Stage / Local Dependency): pos(u) is the
+  (pos(u)/n)^beta  -- Latency Gain (Intra-Stage / Local Dependency): pos(u) is the
                    1-based execution index of u within its bucket in *backward* order
                    (pos=1 = tail, first executed in backward; pos=n = head, last
-                   executed). Tail modules unblock the pipeline and therefore gain
-                   more; head modules are penalised (latency gain → 0).
+                   executed in backward). Head modules (pos=n, larger pos) score
+                   higher because cached params enable earlier prefetch initiation
+                   for the preceding layer, reducing pipeline stalls.
 
 Bucket construction:
   Modules in forward order are accumulated until their cumulative numel exceeds
@@ -120,15 +121,13 @@ class GainModel:
             return []
 
         buckets = self._build_buckets(forward_modules, submodule_sizes)
-        K = len(buckets)  # total number of buckets
 
         gains: List[ModuleGainInfo] = []
         bs = self.prefetch_bucket_size
         D = self.model_total_numel
 
         for bucket in buckets:
-            k = bucket.bucket_idx        # 1-based, 1=input-side
-            k_inv = K - k + 1            # inverted so input-side → large value
+            k = bucket.bucket_idx        # 1-based, 1=input-side, K=output-side
             n = len(bucket.modules)      # modules in this bucket
 
             for pos, ds_id in enumerate(bucket.modules, start=1):
@@ -140,13 +139,13 @@ class GainModel:
                 bandwidth_gain = float(numel)
 
                 # Term 2: Lifespan gain (inter-stage)
-                # k_inv * D / bs: input-side modules (large k_inv) score higher.
-                lifespan_gain = (k_inv * D / bs) ** self.alpha
+                # k * bs / D: output-side modules (large k) score higher.
+                lifespan_gain = (k * bs / D) ** self.alpha
 
                 # Term 3: Latency gain (intra-stage / local dependency)
-                # pos=1 is tail (backward-first): (1 - 1/n) close to 1.
-                # pos=n is head (backward-last):  (1 - n/n) = 0.
-                latency_gain = (1.0 - pos / n) ** self.beta if n > 1 else 0.0
+                # pos=n is head (backward-last): pos/n = 1, maximum gain.
+                # pos=1 is tail (backward-first): pos/n = 1/n, minimum gain.
+                latency_gain = (pos / n) ** self.beta if n > 1 else 0.0
 
                 gain_score = bandwidth_gain + lifespan_gain + latency_gain
 
